@@ -1,9 +1,10 @@
 import subprocess
 import sys
-from common import PTQ1_MTP, environment, server_argv
+from common import DEFAULT_CONTEXT, MODEL_SPECS, environment, file_provenance, server_argv
 
-context = int(sys.argv[1]) if len(sys.argv) > 1 else 262144
-argv = server_argv(PTQ1_MTP, context, 8083)
-argv += ["--spec-type", "draft-mtp", "--spec-draft-n-max", "1"]
+context = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONTEXT
+model = MODEL_SPECS["ptq1-mtp"]
+file_provenance(model["path"], model["sha256"])
+argv = server_argv(model["path"], context, model["port"], spec=model["default_spec"])
 print(" ".join(argv), flush=True)
 raise SystemExit(subprocess.call(argv, env=environment()))
