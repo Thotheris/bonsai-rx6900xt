@@ -1,0 +1,478 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 9b28b318..b814a1ac 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2058,6 +2058,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     // call to pair with, so it's stashed here until that next call fires.
+     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+ 
++    // One generation catch-up token whose KV write is folded into the next draft()
++    // launch. Dropped if that token is rejected. Only used for n_seq == 1.
++    struct deferred_catchup {
++        bool        valid = false;
++        llama_token token = 0;
++        llama_pos   pos   = -1;
++        std::vector<float> embd;
++    };
++    std::vector<deferred_catchup> deferred;
++
+     std::vector<int32_t> i_batch_beg;
+     std::vector<int32_t> i_batch_end;
+ 
+@@ -2139,6 +2149,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+ 
+         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
++        deferred.assign(n_seq, {});
++        for (auto & row : deferred) {
++            row.embd.assign(n_embd, 0.0f);
++        }
+ 
+         i_last.assign(n_seq, -1);
+         i_batch_beg.assign(n_seq, -1);
+@@ -2168,7 +2182,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         llama_batch_free(batch);
+     }
+ 
++    bool flush_deferred() {
++        if (deferred.empty() || !deferred[0].valid) {
++            return true;
++        }
++        auto * ctx_dft = this->params.ctx_dft;
++        common_batch_clear(batch);
++        common_batch_add(batch, deferred[0].token, deferred[0].pos, { 0 }, false);
++        std::memcpy(batch.embd, deferred[0].embd.data(), (size_t) n_embd * sizeof(float));
++        deferred[0].valid = false;
++        const int32_t rc = llama_decode(ctx_dft, batch);
++        common_batch_clear(batch);
++        return rc == 0;
++    }
++
+     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
++        if (seq_id >= 0 && seq_id < (llama_seq_id) deferred.size()) {
++            deferred[seq_id].valid = false;
++        }
+         const int32_t N = (int32_t) prompt.size();
+         if (N <= 0) {
+             return;
+@@ -2187,6 +2218,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     }
+ 
+     bool process(const llama_batch & batch_in) override {
++        if (n_seq == 1 && !deferred.empty() && deferred[0].valid && !flush_deferred()) {
++            return false;
++        }
+         if (batch_in.n_tokens <= 0) {
+             return true;
+         }
+@@ -2222,64 +2256,65 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+         if (!is_mem_shared) {
+-            common_batch_clear(batch);
+-
+-            for (int k = 0; k < n_tokens; ++k) {
+-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+-            }
+-
+-            // shift the tgt embeddings to the right by one position
+-            // assumes that the tokens in the batch are sequential for each sequence
+-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+-            //                                                       ^--- this is a problem
+-            // TODO:this is generally true, but would be nice to assert it
+-            {
+-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
++            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
++            int n_skip = 0;
++            // draft() already decoded the committed token into this KV. The
++            // server keeps that position. Decoding it again uses the same
++            // embedding, so skip the prefix that is already present.
++            if (n_seq == 1 && !chain_heads && n_tokens > 0 && batch_in.pos != nullptr) {
++                const llama_pos dft_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0);
++                while (n_skip < n_tokens && batch_in.pos[n_skip] <= dft_max) {
++                    ++n_skip;
++                }
+             }
+ 
+-            // fill the pending embeddings from a previous run
+-            auto set_h = [&](int idx, const float * h_row) {
+-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+-            };
++            if (n_skip > 0 && n_tokens - n_skip == 1 && n_seq == 1 && !chain_heads) {
++                const int k = n_skip;
++                deferred[0].valid = true;
++                deferred[0].token = batch_in.token[k];
++                deferred[0].pos   = batch_in.pos[k];
++                std::memcpy(deferred[0].embd.data(), h_tgt + (size_t) (k - 1) * n_embd, row_bytes);
++            } else if (n_skip < n_tokens) {
++                common_batch_clear(batch);
+ 
+-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                if (i_batch_beg[seq_id] < 0) {
+-                    continue;
++                for (int k = n_skip; k < n_tokens; ++k) {
++                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
++                    const float * src = k == 0
++                        ? pending_h[batch_in.seq_id[k][0]].data()
++                        : h_tgt + (size_t) (k - 1) * n_embd;
++                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, src, row_bytes);
+                 }
+ 
+-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+-            }
+-
+-            auto * mem_dft = llama_get_memory(ctx_dft);
++                auto * mem_dft = llama_get_memory(ctx_dft);
+ 
+-            bool ok = true;
+-            for (int head = 0; head < n_mtp_layers; ++head) {
+-                if (chain_heads) {
+-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+-                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                        if (i_batch_beg[seq_id] < 0) {
+-                            continue;
++                bool ok = true;
++                for (int head = 0; head < n_mtp_layers; ++head) {
++                    if (chain_heads) {
++                        // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
++                        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                            if (i_batch_beg[seq_id] < 0) {
++                                continue;
++                            }
++                            llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+                         }
+-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
++                        llama_set_nextn_layer_offset(ctx_dft, head);
+                     }
+-                    llama_set_nextn_layer_offset(ctx_dft, head);
+-                }
+ 
+-                const int32_t rc = llama_decode(ctx_dft, batch);
+-                if (rc != 0) {
+-                    SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+-                            head, (int) rc, (int) batch_in.pos[0]);
+-                    ok = false;
+-                    break;
++                    const int32_t rc = llama_decode(ctx_dft, batch);
++                    if (rc != 0) {
++                        SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
++                                head, (int) rc, (int) batch_in.pos[0]);
++                        ok = false;
++                        break;
++                    }
+                 }
+-            }
+ 
+-            if (chain_heads) {
+-                llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+-            }
+-            if (!ok) {
+-                return false;
++                if (chain_heads) {
++                    llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
++                }
++                if (!ok) {
++                    return false;
++                }
+             }
+         }
+ 
+@@ -2303,7 +2338,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         return true;
+     }
+-
+     void draft(common_speculative_draft_params_vec & dparams) override {
+         auto & ctx_dft = params.ctx_dft;
+ 
+@@ -2326,6 +2360,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             drafting[seq_id] = true;
+             common_sampler_reset(smpls[seq_id].get());
+ 
++            if (seq_id == 0 && !deferred.empty() && deferred[0].valid && !chain_heads && deferred[0].pos + 1 == dp.n_past) {
++                common_batch_add(batch, deferred[0].token, deferred[0].pos, { seq_id }, false);
++                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, deferred[0].embd.data(), row_bytes);
++                deferred[0].valid = false;
++            }
++
+             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+ 
+@@ -2459,6 +2499,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+             return;
+         }
++        if (n_accepted == 0 && seq_id < (llama_seq_id) deferred.size()) {
++            deferred[seq_id].valid = false;
++        }
+ 
+         const int32_t n_rows = verify_h_rows[seq_id];
+         if (n_rows <= 0) {
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 69dd9368..76ffd086 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -254,7 +254,9 @@ static __global__ void flash_attn_ext_vec(
+     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
+              // Increment pointers after each loop:
+              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+-
++        const int i_pref = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ - 1)));
++        __builtin_prefetch(K + (i_pref + (int) gridDim.y*nthreads)*nb11, 0, 1);
++        __builtin_prefetch(V + (i_pref + (int) gridDim.y*nthreads)*nb21, 0, 1);
+         // Calculate KQ tile and keep track of new maximum KQ values:
+         float KQ_reg[ncols]; // KQ in registers.
+ 
+@@ -270,6 +272,9 @@ static __global__ void flash_attn_ext_vec(
+ 
+ #pragma unroll
+             for (int j = 0; j < ncols; ++j) {
++                const char * row = K + i_KQ*nb11;
++                __builtin_prefetch(row + 64, 0, 1);
++                __builtin_prefetch(row + 128, 0, 1);
+                 float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                 sum = warp_reduce_sum<nthreads_KQ>(sum);
+ 
+@@ -324,6 +329,11 @@ static __global__ void flash_attn_ext_vec(
+ #pragma unroll
+         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
+             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
++            if (threadIdx.x == 0) {
++                const char * vrow = V + k*nb21;
++                __builtin_prefetch(vrow + 64, 0, 1);
++                __builtin_prefetch(vrow + 128, 0, 1);
++            }
+ 
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+             half2 KQ_k[ncols];
+@@ -551,7 +561,9 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
+     float logit_softcap;
+     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+ 
+-    if (Q->ne[1] == 1) {
++    // n=2 is the MTP verification batch. The ncols=2 kernel is 192 VGPR (one wave).
++    // cols_per_block=1 is one launch, two tiles, of the 112 VGPR kernel. Same math.
++    if (Q->ne[1] <= 2) {
+         constexpr int cols_per_block = 1;
+         if (logit_softcap == 0.0f) {
+             constexpr bool use_logit_softcap = false;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 99f263e3..aebd6a2f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2651,7 +2651,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+          ggml_tensor * v_mla,
+                float   kq_scale,
+                  int   il) const {
+-    const bool v_trans = v->nb[1] > v->nb[2];
++    const bool v_trans = v->nb[1] > v->nb[2] && v->ne[0] > v->ne[2];
+ 
+     // split the batch into streams if needed
+     const auto n_stream = k->ne[3];
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 3df5cedd..62b4495a 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -231,8 +231,18 @@ llama_kv_cache::llama_kv_cache(
+         const bool has_k = true;
+         const bool has_v = !is_mla;
+ 
+-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
++        // Head-major: tokens of one KV head are contiguous. Same byte count as
++        // [n_embd_gqa, kv_size]. FA then scans one head at stride 144, not 576.
++        const uint32_t n_head_kv = hparams.n_head_kv(il);
++        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, hparams.n_embd_head_k(il), kv_size, n_head_kv * n_stream) : nullptr;
++        ggml_tensor * v = nullptr;
++        if (has_v) {
++            if (!v_trans) {
++                v = ggml_new_tensor_3d(ctx, type_v, hparams.n_embd_head_v(il), kv_size, n_head_kv * n_stream);
++            } else {
++                v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
++            }
++        }
+ 
+         has_k && ggml_format_name(k, "cache_k_l%d", il);
+         has_v && ggml_format_name(v, "cache_v_l%d", il);
+@@ -241,8 +251,14 @@ llama_kv_cache::llama_kv_cache(
+         std::vector<ggml_tensor *> v_stream;
+ 
+         for (uint32_t s = 0; s < n_stream; ++s) {
+-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
++            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, hparams.n_embd_head_k(il), kv_size * n_head_kv, k->nb[1], s * n_head_kv * k->nb[2]) : nullptr);
++            if (!has_v) {
++                v_stream.push_back(nullptr);
++            } else if (!v_trans) {
++                v_stream.push_back(ggml_view_2d(ctx, v, hparams.n_embd_head_v(il), kv_size * n_head_kv, v->nb[1], s * n_head_kv * v->nb[2]));
++            } else {
++                v_stream.push_back(ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s * v->nb[2]));
++            }
+         }
+ 
+         map_layer_ids[il] = layers.size();
+@@ -1256,19 +1272,18 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
+ 
+     auto * k = layers[ikv].k;
+ 
+-    const uint64_t kv_size      = get_size();
+-    const uint64_t n_embd_k_gqa = k->ne[0];
+-
+-    assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
+-
++    const uint64_t kv_size = get_size();
++    const uint32_t n_head = hparams.n_head_kv(il);
+     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+-
++    const size_t head_row = ggml_row_size(k->type, hparams.n_embd_head_k(il));
++    // Physical [head_dim, kv_size, n_head * n_stream]. nb1 is the head slab and
++    // nb2 is the token so the existing permute gives FA a contiguous token scan.
+     return ggml_view_4d(ctx, k,
+-            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
+-            ggml_row_size(k->type, hparams.n_embd_head_k(il)),
+-            ggml_row_size(k->type, n_embd_k_gqa),
+-            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
+-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
++            hparams.n_embd_head_k(il), n_head, n_kv, ns,
++            head_row * kv_size,
++            head_row,
++            head_row * kv_size * n_head,
++            head_row * kv_size * n_head * sinfo.s0);
+ }
+ 
+ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+@@ -1276,24 +1291,24 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
+ 
+     auto * v = layers[ikv].v;
+ 
+-    const uint64_t kv_size      = get_size();
+-    const uint64_t n_embd_v_gqa = v->ne[0];
+-
+-    // [TAG_V_CACHE_VARIABLE]
+-    assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
+-
++    const uint64_t kv_size = get_size();
+     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+ 
+     if (!v_trans) {
+-        // note: v->nb[1] <= v->nb[2]
++        const uint32_t n_head = hparams.n_head_kv(il);
++        const size_t head_row = ggml_row_size(v->type, hparams.n_embd_head_v(il));
+         return ggml_view_4d(ctx, v,
+-                hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
+-                ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
+-                ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
+-                ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
+-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
++                hparams.n_embd_head_v(il), n_head, n_kv, ns,
++                head_row * kv_size,
++                head_row,
++                head_row * kv_size * n_head,
++                head_row * kv_size * n_head * sinfo.s0);
+     }
+ 
++    const uint64_t n_embd_v_gqa = v->ne[0];
++    // [TAG_V_CACHE_VARIABLE]
++    assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
++
+     // note: v->nb[1] > v->nb[2]
+     return ggml_view_4d(ctx, v,
+             n_kv, hparams.n_head_kv(il), hparams.n_embd_head_v(il), ns,
+@@ -1326,28 +1341,22 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
+     const int64_t n_head      = k_cur->ne[1];
+     const int64_t n_tokens    = k_cur->ne[2];
+ 
+-    const int64_t n_embd_gqa = n_embd_head*n_head;
+-
+-    // we can merge dims 0 and 1
+-    // TODO: add ggml helper function for this?
+     GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
++    GGML_ASSERT(k->ne[2] % n_head == 0);
+ 
+-    k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
+-
+-    const int64_t n_stream = k->ne[2];
+-
+-    if (n_stream > 1) {
+-        const int64_t kv_size = get_size();
+-
+-        assert(n_embd_gqa == k->ne[0]);
+-        assert(kv_size    == k->ne[1]);
+-
+-        // merge the buffer across all streams because the idxs are global
+-        k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
++    // One set_rows per head. View from the cache tensor so offsets do not stack.
++    // src[1] chains the writes so forward-expand keeps every head.
++    ggml_tensor * last = nullptr;
++    const int64_t kv_size = k->ne[1];
++    for (int64_t h = 0; h < n_head; ++h) {
++        ggml_tensor * src = ggml_view_2d(ctx, k_cur, n_embd_head, n_tokens, k_cur->nb[2], h * k_cur->nb[1]);
++        ggml_tensor * dst = ggml_view_2d(ctx, k, n_embd_head, kv_size, k->nb[1], h * k->nb[2]);
++        if (last) {
++            dst->src[1] = last;
++        }
++        last = ggml_set_rows(ctx, dst, src, k_idxs);
+     }
+-
+-    // store the current K values into the cache
+-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
++    return last;
+ }
+ 
+ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
+@@ -1366,25 +1375,21 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
+     // we can merge dims 0 and 1
+     GGML_ASSERT(ggml_row_size(v_cur->type, n_embd_head) == v_cur->nb[1]);
+ 
+-    const int64_t n_stream = v->ne[2];
+-
+-    // take this branch when FA is enabled (the V cache is not transposed)
+     if (!v_trans) {
+-        v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
+-
+-        if (n_stream > 1) {
+-            const int64_t kv_size = get_size();
+-
+-            assert(n_embd_gqa == v->ne[0]);
+-            assert(kv_size    == v->ne[1]);
+-
+-            // merge the buffer across all streams because the idxs are global
+-            v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
++        ggml_tensor * last = nullptr;
++        const int64_t kv_size = v->ne[1];
++        for (int64_t h = 0; h < n_head; ++h) {
++            ggml_tensor * src = ggml_view_2d(ctx, v_cur, n_embd_head, n_tokens, v_cur->nb[2], h * v_cur->nb[1]);
++            ggml_tensor * dst = ggml_view_2d(ctx, v, n_embd_head, kv_size, v->nb[1], h * v->nb[2]);
++            if (last) {
++                dst->src[1] = last;
++            }
++            last = ggml_set_rows(ctx, dst, src, v_idxs);
+         }
+-
+-        return ggml_set_rows(ctx, v, v_cur, v_idxs);
++        return last;
+     }
+ 
++
+     if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {
+         // we can merge dims 0, 1 and 2
+         v_cur = ggml_reshape_2d(ctx, v_cur, n_embd_gqa, n_tokens);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a9edbd7b..0467948a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2946,7 +2946,12 @@ private:
+                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                 }
+ 
+-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
++                // Full checkpoint restore puts the draft KV back to pos_max.
++                // Otherwise draft() has already written the committed token at
++                // pos_max+1; keep it and let process() skip that prefix.
++                // Rejected speculative positions are removed by slot.mem.seq_rm.
++                const llama_pos rm_from = ckpt.pos_max + (use_ckpt_dft ? 1 : 2);
++                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, rm_from, -1)) {
+                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                 }
+             }
