@@ -4,7 +4,7 @@ Source-built Windows HIP recipe for **both Bonsai 2 27B packings**, PTQ1_0 and P
 
 ## Build from source
 
-Requirements: Windows x64, RX 6900 XT, Git, CMake, Ninja, an x64 Visual Studio Developer Command Prompt, and a Python environment containing TheRock's `_rocm_sdk_devel` package. The fork is pinned to [PrismML llama.cpp commit `23d0d71502d690230131f22b1393ac41d6b4406e`](https://github.com/PrismML-Eng/llama.cpp/commit/23d0d71502d690230131f22b1393ac41d6b4406e). `kernel/build-staging.cmd` clones that revision into ignored `_work/llama.cpp`, applies `kernel/patches/0001-rdna2-ptq1-hip-mmvq.patch`, and builds `llama-server`, `llama-bench`, and `test-backend-ops` under ignored `_work/build-gfx1030/`. The patch contains the validated native HIP ternary dot path, two-row PTQ1 tile with bounded final-row reads, and PTQ1/F16 support; it does not modify PQ2 decode.
+Requirements: Windows x64, RX 6900 XT, Git, CMake, Ninja, an x64 Visual Studio Developer Command Prompt, and a Python environment containing TheRock's `_rocm_sdk_devel` package. The fork is pinned to [PrismML llama.cpp commit `23d0d71502d690230131f22b1393ac41d6b4406e`](https://github.com/PrismML-Eng/llama.cpp/commit/23d0d71502d690230131f22b1393ac41d6b4406e). `kernel/build-staging.cmd` clones that revision into ignored `_work/llama.cpp`, applies `kernel/patches/0001-rdna2-ptq1-hip-mmvq.patch` and then `kernel/patches/0002-rdna2-fa-kv-prefetch.patch`, and builds `llama-server`, `llama-bench`, and `test-backend-ops` under ignored `_work/build-gfx1030/`. Patch 0001 is the native HIP ternary dot path. Patch 0002 is the measured decode path: head-major q4_0 KV, flash-attention line prefetches, the MTP n=2 batch on two single-column tiles, and the one-token draft catch-up folded into the next draft launch.
 
 In the x64 Developer Command Prompt:
 
@@ -57,6 +57,16 @@ each format. The fresh PTQ1 run also matched the frozen control's token
 IDs and UTF-8 output in all three prompts, both with MTP off and on.
 
 The original PQ2 depth curve and its long-context MTP slowdown used the *older* model named above. A single exploratory depth-32768 sample on the new graft measured 34.48 tok/s MTP-off and 32.69 tok/s MTP-on; one repetition per arm fails the three-repetition headline gate, and residency was unverified. Do not claim a Bonsai 2 PQ2 MTP speedup, production throughput, or 262144-token fit from these observations. Contributors can reproduce their own [hash-bound measurements](CONTRIBUTING.md), but should not compare unmatched desktop sessions or publish identifying process lists.
+
+Patch 0002 was compared, on one desktop-active session, with the historical frozen DLL `7920de6a4b6f843da72f9f258c8e8e58aa006a99874fb267f796fb17e37bb6fc` fill curve for the current grafted PTQ1 MTP file. Same protocol: context 204800, MTP on, one pp512/tg128 sample after filling each depth. Residency was unverified, and one sample is not a headline.
+
+| depth | frozen 3-rep median tok/s | patch 0002, one sample tok/s |
+| --- | ---: | ---: |
+| 65536 | 19.52 | 44.88 |
+| 131072 | 12.27 | 32.49 |
+| 190464 | 9.21 | 25.54 |
+
+Prompt-512 speed at those depths did not move. A separate one-sample MTP-on decode after a 36864-token prompt, context 65536, was 54.03 tok/s against a kept-pair observation of 56.44–56.51 on a rebuild of the same source. These figures describe that session. They are not a resident or three-repetition claim.
 
 ## Attribution
 
